@@ -9,7 +9,7 @@ Python Standard Library.
 
 Homepage and documentation: http://bottlepy.org/
 
-Copyright (c) 2015, Marcel Hellkamp.
+Copyright (c) 2017, Marcel Hellkamp.
 License: MIT (see LICENSE for details)
 """
 
@@ -30,9 +30,8 @@ __license__ = 'MIT'
 def _cli_parse(args):  # pragma: no coverage
     from argparse import ArgumentParser
 
-    parser = ArgumentParser(usage="usage: %sprog [options] package.module:app")
+    parser = ArgumentParser(prog=args[0], usage="%(prog)s [options] package.module:app")
     opt = parser.add_argument
-    opt('app', help='WSGI app entry point.')
     opt("--version", action="store_true", help="show version number.")
     opt("-b", "--bind", metavar="ADDRESS", help="bind socket to ADDRESS.")
     opt("-s", "--server", default='wsgiref', help="use SERVER as backend.")
@@ -43,8 +42,9 @@ def _cli_parse(args):  # pragma: no coverage
         help="override config values.")
     opt("--debug", action="store_true", help="start server in debug mode.")
     opt("--reload", action="store_true", help="auto-reload on file changes.")
+    opt('app', help='WSGI app entry point.', nargs='?')
 
-    cli_args = parser.parse_args(args)
+    cli_args = parser.parse_args(args[1:])
 
     return cli_args, parser
 
@@ -77,7 +77,11 @@ from datetime import date as datedate, datetime, timedelta
 from tempfile import TemporaryFile
 from traceback import format_exc, print_exc
 from unicodedata import normalize
-from json import dumps as json_dumps, loads as json_lds
+
+try:
+    from ujson import dumps as json_dumps, loads as json_lds
+except ImportError:
+    from json import dumps as json_dumps, loads as json_lds
 
 # inspect.getargspec was removed in Python 3.6, use
 # Signature-based version where we can (Python 3.3+)
@@ -124,7 +128,7 @@ if py3k:
     from urllib.parse import urljoin, SplitResult as UrlSplitResult
     from urllib.parse import urlencode, quote as urlquote, unquote as urlunquote
     urlunquote = functools.partial(urlunquote, encoding='latin1')
-    from http.cookies import SimpleCookie
+    from http.cookies import SimpleCookie, Morsel, CookieError
     from collections import MutableMapping as DictMixin
     import pickle
     from io import BytesIO
@@ -143,7 +147,7 @@ else:  # 2.x
     import thread
     from urlparse import urljoin, SplitResult as UrlSplitResult
     from urllib import urlencode, quote as urlquote, unquote as urlunquote
-    from Cookie import SimpleCookie
+    from Cookie import SimpleCookie, Morsel, CookieError
     from itertools import imap
     import cPickle as pickle
     from StringIO import StringIO as BytesIO
@@ -490,7 +494,7 @@ class Router(object):
         nocheck = set(methods)
         for method in set(self.static) - nocheck:
             if path in self.static[method]:
-                allowed.add(verb)
+                allowed.add(method)
         for method in set(self.dyna_regexes) - allowed - nocheck:
             for combined, rules in self.dyna_regexes[method]:
                 match = combined(path)
@@ -947,14 +951,27 @@ class Bottle(object):
         """ Equals :meth:`route` with a ``PATCH`` method parameter. """
         return self.route(path, method, **options)
 
-    def error(self, code=500):
-        """ Decorator: Register an output handler for a HTTP error code"""
+    def error(self, code=500, callback=None):
+        """ Register an output handler for a HTTP error code. Can
+            be used as a decorator or called directly ::
 
-        def wrapper(handler):
-            self.error_handler[int(code)] = handler
-            return handler
+                def error_handler_500(error):
+                    return 'error_handler_500'
 
-        return wrapper
+                app.error(code=500, callback=error_handler_500)
+
+                @app.error(404)
+                def error_handler_404(error):
+                    return 'error_handler_404'
+
+        """
+
+        def decorator(callback):
+            if isinstance(callback, basestring): callback = load(callback)
+            self.error_handler[int(code)] = callback
+            return callback
+
+        return decorator(callback) if callback else decorator
 
     def default_error_handler(self, res):
         return tob(template(ERROR_PAGE_TEMPLATE, e=res, template_settings=dict(name='__ERROR_PAGE_TEMPLATE')))
@@ -1796,6 +1813,10 @@ class BaseResponse(object):
             :param secure: limit the cookie to HTTPS connections (default: off).
             :param httponly: prevents client-side javascript to read this cookie
               (default: off, requires Python 2.6 or newer).
+            :param same_site: disables third-party use for a cookie.
+              Allowed attributes: `lax` and `strict`.
+              In strict mode the cookie will never be sent.
+              In lax mode the cookie is only sent with a top-level GET request.
 
             If neither `expires` nor `max_age` is set (default), the cookie will
             expire at the end of the browser session (as soon as the browser
@@ -1817,6 +1838,9 @@ class BaseResponse(object):
         """
         if not self._cookies:
             self._cookies = SimpleCookie()
+
+        # To add "SameSite" cookie support.
+        Morsel._reserved['same-site'] = 'SameSite'
 
         if secret:
             if not isinstance(value, basestring):
@@ -1846,6 +1870,9 @@ class BaseResponse(object):
                 elif isinstance(value, (int, float)):
                     value = time.gmtime(value)
                 value = time.strftime("%a, %d %b %Y %H:%M:%S GMT", value)
+            # check values for SameSite cookie, because it's not natively supported by http.cookies.
+            if key == 'same_site' and value.lower() not in ('lax', 'strict'):
+                raise CookieError("Invalid attribute %r" % (key,))
             if key in ('secure', 'httponly') and not value:
                 continue
             self._cookies[name][key.replace('_', '-')] = value
@@ -3232,7 +3259,11 @@ class WSGIRefServer(ServerAdapter):
 
 class CherryPyServer(ServerAdapter):
     def run(self, handler):  # pragma: no cover
-        from cherrypy import wsgiserver
+        depr(0, 13, "The wsgi server part of cherrypy was split into a new "
+                    "project called 'cheroot'.", "Use the 'cheroot' server "
+                    "adapter instead of cherrypy.")
+        from cherrypy import wsgiserver # This will fail for CherryPy >= 9
+
         self.options['bind_addr'] = (self.host, self.port)
         self.options['wsgi_app'] = handler
 
@@ -3249,6 +3280,25 @@ class CherryPyServer(ServerAdapter):
         if keyfile:
             server.ssl_private_key = keyfile
 
+        try:
+            server.start()
+        finally:
+            server.stop()
+
+
+class CherootServer(ServerAdapter):
+    def run(self, handler): # pragma: no cover
+        from cheroot import wsgi
+        from cheroot.ssl import builtin
+        self.options['bind_addr'] = (self.host, self.port)
+        self.options['wsgi_app'] = handler
+        certfile = self.options.pop('certfile', None)
+        keyfile = self.options.pop('keyfile', None)
+        chainfile = self.options.pop('chainfile', None)
+        server = wsgi.Server(**self.options)
+        if certfile and keyfile:
+            server.ssl_adapter = builtin.BuiltinSSLAdapter(
+                    certfile, keyfile, chainfile)
         try:
             server.start()
         finally:
@@ -3490,7 +3540,7 @@ class AiohttpUVLoopServer(AiohttpServer):
 class AutoServer(ServerAdapter):
     """ Untested. """
     adapters = [WaitressServer, PasteServer, TwistedServer, CherryPyServer,
-                WSGIRefServer]
+                CherootServer, WSGIRefServer]
 
     def run(self, handler):
         for sa in self.adapters:
@@ -3506,6 +3556,7 @@ server_names = {
     'wsgiref': WSGIRefServer,
     'waitress': WaitressServer,
     'cherrypy': CherryPyServer,
+    'cheroot': CherootServer,
     'paste': PasteServer,
     'fapws3': FapwsServer,
     'tornado': TornadoServer,
